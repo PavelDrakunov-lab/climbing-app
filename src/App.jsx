@@ -14,12 +14,6 @@ const GYMS = [
   'Другой зал',
 ];
 
-const LEVELS = [
-  { value: 'beginner', label: 'Новичок', range: '5a–6a / V0–V2' },
-  { value: 'intermediate', label: 'Средний', range: '6b–7a / V3–V5' },
-  { value: 'advanced', label: 'Опытный', range: '7b+ / V6+' },
-];
-
 const STYLES = [
   { value: 'boulder', label: 'Боулдер' },
   { value: 'rope', label: 'Трудность' },
@@ -46,9 +40,6 @@ const WEEKDAYS = [
 const SESSIONS_KEY = 'climbing-sessions-v2';
 const LOG_KEY = 'climbing-log-v1';
 const GYM_NOTES_KEY = 'climbing-gym-notes-v1';
-const CHECKINS_KEY = 'climbing-checkins-v1';
-
-const CHECKIN_DURATION_MS = 3 * 60 * 60 * 1000;
 
 const GRADE_SCORES = {
   '5a': 1, '5b': 2, '5c': 3,
@@ -56,6 +47,32 @@ const GRADE_SCORES = {
   '7a': 10, '7a+': 11, '7b': 12, '7b+': 13, '7c': 14, '7c+': 15,
   '8a': 16, '8a+': 17, '8b': 18, '8b+': 19, '8c': 20, '8c+': 21,
 };
+
+// Группы уровней для автоматического вычисления по истории журнала.
+// Берём топовую категорию из всех тренировок и определяем диапазон.
+const LEVEL_GROUPS = [
+  { value: 'beginner', label: 'до 6а', max: GRADE_SCORES['6a'] },          // <= 6a
+  { value: 'intermediate', label: '6б–7а', max: GRADE_SCORES['7a'] },       // 6a+ … 7a
+  { value: 'advanced', label: '7б+', max: Infinity },                       // 7a+ и выше
+];
+
+function levelFromTopScore(score) {
+  if (!score) return null;
+  for (const g of LEVEL_GROUPS) {
+    if (score <= g.max) return g;
+  }
+  return LEVEL_GROUPS[LEVEL_GROUPS.length - 1];
+}
+
+function computeLevelForClimber(climberName, log) {
+  let topScore = 0;
+  for (const e of log) {
+    if (e.name !== climberName) continue;
+    const top = maxGradeFromText(e.grades);
+    if (top && top.score > topScore) topScore = top.score;
+  }
+  return levelFromTopScore(topScore);
+}
 
 function todayISO() {
   const d = new Date();
@@ -118,16 +135,13 @@ function maxGradeFromText(text) {
 }
 
 export default function App() {
-  const [tab, setTab] = useState('partners');
+  const [tab, setTab] = useState('home'); // home | partners | log | leaderboard | gyms
   const [sessions, setSessions] = useState([]);
   const [log, setLog] = useState([]);
   const [gymNotes, setGymNotes] = useState({});
-  const [checkins, setCheckins] = useState([]);
   const [loading, setLoading] = useState(true);
 
   const [showSessionForm, setShowSessionForm] = useState(false);
-  const [showRecurringForm, setShowRecurringForm] = useState(false);
-  const [showCheckinForm, setShowCheckinForm] = useState(false);
   const [completingSession, setCompletingSession] = useState(null);
   const [editingGym, setEditingGym] = useState(null);
 
@@ -139,13 +153,9 @@ export default function App() {
   const [gym, setGym] = useState(GYMS[0]);
   const [date, setDate] = useState(todayISO());
   const [time, setTime] = useState('19:00');
-  const [level, setLevel] = useState('intermediate');
   const [style, setStyle] = useState('any');
   const [condition, setCondition] = useState('normal');
   const [note, setNote] = useState('');
-
-  const [recurringDays, setRecurringDays] = useState([2, 4]);
-  const [recurringWeeks, setRecurringWeeks] = useState(4);
 
   const [completedFlash, setCompletedFlash] = useState(0);
   const [completedProjects, setCompletedProjects] = useState(0);
@@ -155,7 +165,6 @@ export default function App() {
   const [completedNote, setCompletedNote] = useState('');
 
   const [gymNoteText, setGymNoteText] = useState('');
-  const [checkinNote, setCheckinNote] = useState('');
 
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -181,11 +190,6 @@ export default function App() {
           const parsed = JSON.parse(gymsRaw);
           if (parsed && typeof parsed === 'object') setGymNotes(parsed);
         }
-        const checkinsRaw = localStorage.getItem(CHECKINS_KEY);
-        if (checkinsRaw) {
-          const parsed = JSON.parse(checkinsRaw);
-          if (Array.isArray(parsed)) setCheckins(parsed);
-        }
         const savedName = localStorage.getItem('climber-name');
         if (savedName) setName(savedName);
       } catch (e) { console.error(e); }
@@ -206,10 +210,6 @@ export default function App() {
     setGymNotes(next);
     try { localStorage.setItem(GYM_NOTES_KEY, JSON.stringify(next)); } catch (e) { console.error(e); }
   }
-  function saveCheckins(next) {
-    setCheckins(next);
-    try { localStorage.setItem(CHECKINS_KEY, JSON.stringify(next)); } catch (e) { console.error(e); }
-  }
 
   async function handleAddSession() {
     if (!name.trim()) return;
@@ -218,7 +218,7 @@ export default function App() {
     const newSession = {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
       name: name.trim(),
-      gym, date, time, level, style, condition,
+      gym, date, time, style, condition,
       note: note.trim(),
       interested: [],
       createdAt: Date.now(),
@@ -226,39 +226,7 @@ export default function App() {
     saveSessions([...sessions, newSession]);
     setShowSessionForm(false);
     setNote('');
-  }
-
-  async function handleAddRecurring() {
-    if (!name.trim() || recurringDays.length === 0) return;
-    try { localStorage.setItem('climber-name', name.trim()); } catch (e) {}
-
-    const newSessions = [];
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const endDate = new Date(today);
-    endDate.setDate(today.getDate() + recurringWeeks * 7);
-
-    const cursor = new Date(today);
-    while (cursor <= endDate) {
-      if (recurringDays.includes(cursor.getDay())) {
-        const iso = cursor.toISOString().slice(0, 10);
-        newSessions.push({
-          id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7) + '_' + iso,
-          name: name.trim(),
-          gym, time, level, style, condition,
-          date: iso,
-          note: note.trim(),
-          interested: [],
-          recurring: true,
-          createdAt: Date.now(),
-        });
-      }
-      cursor.setDate(cursor.getDate() + 1);
-    }
-
-    saveSessions([...sessions, ...newSessions]);
-    setShowRecurringForm(false);
-    setNote('');
+    setTab('home');
   }
 
   async function handleDeleteSession(id) {
@@ -323,6 +291,7 @@ export default function App() {
     saveLog([entry, ...log]);
     saveSessions(sessions.filter((s) => s.id !== completingSession.id));
     setCompletingSession(null);
+    setTab('leaderboard');
   }
 
   async function handleDeleteLogEntry(id) {
@@ -343,42 +312,18 @@ export default function App() {
     setEditingGym(null);
   }
 
-  async function handleCheckin() {
-    if (!name.trim()) return;
-    try { localStorage.setItem('climber-name', name.trim()); } catch (e) {}
-
-    const climber = name.trim();
-    const filtered = checkins.filter((c) => c.name !== climber);
-    const newCheckin = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-      name: climber,
-      gym,
-      note: checkinNote.trim(),
-      condition,
-      checkedInAt: Date.now(),
-    };
-    saveCheckins([...filtered, newCheckin]);
-    setShowCheckinForm(false);
-    setCheckinNote('');
-  }
-
-  async function handleCheckout() {
-    const climber = name.trim() || 'Аноним';
-    saveCheckins(checkins.filter((c) => c.name !== climber));
-  }
-
-  const activeCheckins = useMemo(() => {
-    const now = Date.now();
-    return checkins
-      .filter((c) => now - c.checkedInAt < CHECKIN_DURATION_MS)
-      .sort((a, b) => b.checkedInAt - a.checkedInAt);
-  }, [checkins]);
-
-  const myActiveCheckin = useMemo(() => {
-    const climber = name.trim();
-    if (!climber) return null;
-    return activeCheckins.find((c) => c.name === climber) || null;
-  }, [activeCheckins, name]);
+  // Уровень каждого человека вычисляется один раз из всего журнала и кешируется
+  const climberLevels = useMemo(() => {
+    const map = {};
+    for (const e of log) {
+      const top = maxGradeFromText(e.grades);
+      if (!top) continue;
+      if (!map[e.name] || top.score > map[e.name].topScore) {
+        map[e.name] = { topScore: top.score, level: levelFromTopScore(top.score) };
+      }
+    }
+    return map;
+  }, [log]);
 
   const now = new Date();
   const visibleSessions = sessions
@@ -387,7 +332,12 @@ export default function App() {
       // показываем сегодняшние записи весь день, плюс будущие
       return dt.getTime() > now.getTime() - 12 * 60 * 60 * 1000;
     })
-    .filter((s) => filter === 'all' || s.level === filter)
+    .filter((s) => {
+      if (filter === 'all') return true;
+      const lvl = climberLevels[s.name]?.level;
+      if (filter === 'unknown') return !lvl;
+      return lvl?.value === filter;
+    })
     .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
 
   const leaderboard = useMemo(() => {
@@ -418,38 +368,16 @@ export default function App() {
     <div className="min-h-screen bg-stone-50" style={{ fontFamily: "'Fraunces', Georgia, serif" }}>
       <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700;9..144,900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
 
-      <header className="border-b-2 border-stone-900 bg-stone-50 sticky top-0 z-10">
-        <div className="max-w-2xl mx-auto px-4 pt-4">
-          <div className="flex items-baseline justify-between mb-3">
-            <div>
-              <h1 className="text-2xl font-black tracking-tight text-stone-900 leading-none">
-                КТО ЛЕЗЕТ
-              </h1>
-              <p className="text-xs text-stone-500 mt-1" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                {activeCheckins.length > 0
-                  ? `🟢 сейчас в зале: ${activeCheckins.length}`
-                  : 'партнёры · журнал · рейтинг · залы'}
-              </p>
-            </div>
-            <div className="text-right">
-              <div className="text-3xl font-black text-orange-600 leading-none">
-                {tab === 'partners' ? visibleSessions.length
-                  : tab === 'log' ? log.length
-                  : tab === 'leaderboard' ? leaderboard.length
-                  : Object.keys(gymNotes).length}
-              </div>
-              <div className="text-[10px] uppercase tracking-widest text-stone-500 mt-1" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                {tab === 'partners' ? 'записей'
-                  : tab === 'log' ? 'тренировок'
-                  : tab === 'leaderboard' ? 'участников'
-                  : 'заметок'}
-              </div>
-            </div>
-          </div>
+      <header className="border-b border-stone-200 bg-stone-50 sticky top-0 z-10">
+        <div className="max-w-2xl mx-auto px-4 pt-3">
+          <h1 className="text-xl font-black tracking-tight text-stone-900 leading-none mb-3">
+            КТО ЛЕЗЕТ
+          </h1>
           <nav className="flex gap-1 -mb-px overflow-x-auto">
+            <TabButton active={tab === 'home'} onClick={() => setTab('home')}>Главная</TabButton>
             <TabButton active={tab === 'partners'} onClick={() => setTab('partners')}>Партнёры</TabButton>
-            <TabButton active={tab === 'log'} onClick={() => setTab('log')}>Журнал</TabButton>
             <TabButton active={tab === 'leaderboard'} onClick={() => setTab('leaderboard')}>Рейтинг</TabButton>
+            <TabButton active={tab === 'log'} onClick={() => setTab('log')}>Журнал</TabButton>
             <TabButton active={tab === 'gyms'} onClick={() => setTab('gyms')}>Залы</TabButton>
           </nav>
         </div>
@@ -458,10 +386,26 @@ export default function App() {
       <main className="max-w-2xl mx-auto px-4 py-6 pb-32">
         {loading ? (
           <div className="text-center py-12 text-stone-400 italic">Загружаем…</div>
+        ) : tab === 'home' ? (
+          <HomeTab
+            sessions={sessions}
+            log={log}
+            climberLevels={climberLevels}
+            leaderboard={leaderboard}
+            currentName={name}
+            onStartNewSession={() => {
+              setDate(todayISO());
+              setTime(nowPlusHourTime());
+              setShowSessionForm(true);
+            }}
+            onComplete={openComplete}
+            onCancel={handleDeleteSession}
+            onGoToLeaderboard={() => setTab('leaderboard')}
+          />
         ) : tab === 'partners' ? (
           <PartnersTab
             sessions={visibleSessions}
-            checkins={activeCheckins}
+            climberLevels={climberLevels}
             currentName={name}
             filter={filter}
             setFilter={setFilter}
@@ -484,116 +428,26 @@ export default function App() {
         )}
       </main>
 
-      {!showSessionForm && !showRecurringForm && !showCheckinForm && !completingSession && !editingGym && tab === 'partners' && (
-        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 flex gap-2">
-          {myActiveCheckin ? (
-            <button
-              onClick={handleCheckout}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-3 rounded-full shadow-lg font-bold tracking-wide transition active:scale-95 flex items-center gap-2"
-              style={{ fontFamily: "'Fraunces', serif" }}
-            >
-              <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
-              Я в зале · уйти
-            </button>
-          ) : (
-            <button
-              onClick={() => setShowCheckinForm(true)}
-              className="bg-emerald-600 hover:bg-emerald-700 text-white px-5 py-3 rounded-full shadow-lg font-bold tracking-wide transition active:scale-95"
-              style={{ fontFamily: "'Fraunces', serif" }}
-            >
-              📍 Я тут
-            </button>
-          )}
-          <button
-            onClick={() => {
-              setDate(todayISO());
-              setTime(nowPlusHourTime());
-              setShowSessionForm(true);
-            }}
-            className="bg-orange-600 hover:bg-orange-700 text-white px-5 py-3 rounded-full shadow-lg font-bold tracking-wide transition active:scale-95"
-            style={{ fontFamily: "'Fraunces', serif" }}
-          >
-            + Иду лазать
-          </button>
-          <button
-            onClick={() => setShowRecurringForm(true)}
-            className="bg-stone-900 hover:bg-stone-800 text-white px-4 py-3 rounded-full shadow-lg font-bold tracking-wide transition active:scale-95"
-            style={{ fontFamily: "'Fraunces', serif" }}
-            title="Регулярные слоты"
-          >
-            ⟳
-          </button>
-        </div>
-      )}
-
-      {showCheckinForm && (
-        <Modal title="Я сейчас в зале" onClose={() => setShowCheckinForm(false)}>
-          <p className="text-sm text-stone-600 -mt-1 mb-2">
-            Скажи друзьям, что ты на скалодроме прямо сейчас. Чекин держится 3 часа, потом пропадает сам.
-          </p>
-          <Field label="Имя">
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Как тебя зовут"
-              className="w-full bg-white border border-stone-300 rounded px-3 py-2 text-stone-900 focus:border-emerald-600 focus:outline-none"
-            />
-          </Field>
-          <Field label="Зал">
-            <select
-              value={gym}
-              onChange={(e) => setGym(e.target.value)}
-              className="w-full bg-white border border-stone-300 rounded px-3 py-2 text-stone-900 focus:border-emerald-600 focus:outline-none"
-            >
-              {GYMS.map((g) => <option key={g} value={g}>{g}</option>)}
-            </select>
-          </Field>
-          <Field label="Самочувствие">
-            <div className="grid grid-cols-4 gap-2">
-              {CONDITIONS.map((c) => (
-                <button
-                  key={c.value}
-                  onClick={() => setCondition(c.value)}
-                  className={`py-2 rounded border-2 transition ${
-                    condition === c.value
-                      ? 'border-stone-900 bg-stone-900 text-stone-50'
-                      : 'border-stone-300 bg-white text-stone-700 hover:border-stone-500'
-                  }`}
-                >
-                  <div className="text-lg leading-none">{c.emoji}</div>
-                  <div className="text-[10px] mt-1" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                    {c.label.toLowerCase()}
-                  </div>
-                </button>
-              ))}
-            </div>
-          </Field>
-          <Field label="Сообщение (необязательно)">
-            <input
-              type="text"
-              value={checkinNote}
-              onChange={(e) => setCheckinNote(e.target.value)}
-              placeholder="например: на левой стене, до 22:00"
-              className="w-full bg-white border border-stone-300 rounded px-3 py-2 text-stone-900 focus:border-emerald-600 focus:outline-none"
-            />
-          </Field>
-          <button
-            onClick={handleCheckin}
-            disabled={!name.trim()}
-            className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:bg-stone-300 disabled:cursor-not-allowed text-white py-3 rounded font-bold tracking-wide transition active:scale-95 mt-2"
-            style={{ fontFamily: "'Fraunces', serif" }}
-          >
-            📍 Я здесь
-          </button>
-        </Modal>
+      {!showSessionForm && !completingSession && !editingGym && tab === 'partners' && (
+        <button
+          onClick={() => {
+            setDate(todayISO());
+            setTime(nowPlusHourTime());
+            setShowSessionForm(true);
+          }}
+          className="fixed bottom-6 right-6 bg-orange-600 hover:bg-orange-700 text-white w-14 h-14 rounded-full shadow-lg text-2xl font-bold transition active:scale-95"
+          style={{ fontFamily: "'Fraunces', serif" }}
+          title="Записаться на тренировку"
+        >
+          +
+        </button>
       )}
 
       {showSessionForm && (
         <Modal title="Новая запись" onClose={() => setShowSessionForm(false)}>
           <SessionFormFields
             {...{ name, setName, gym, setGym, date, setDate, time, setTime,
-                  level, setLevel, style, setStyle, condition, setCondition, note, setNote }}
+                  style, setStyle, condition, setCondition, note, setNote }}
             showDate
           />
           <button
@@ -603,68 +457,6 @@ export default function App() {
             style={{ fontFamily: "'Fraunces', serif" }}
           >
             Записаться
-          </button>
-        </Modal>
-      )}
-
-      {showRecurringForm && (
-        <Modal title="Регулярные слоты" onClose={() => setShowRecurringForm(false)}>
-          <p className="text-sm text-stone-600 -mt-1 mb-2">
-            Записать тебя на одно и то же время в выбранные дни недели
-          </p>
-          <SessionFormFields
-            {...{ name, setName, gym, setGym, date, setDate, time, setTime,
-                  level, setLevel, style, setStyle, condition, setCondition, note, setNote }}
-            showDate={false}
-          />
-          <Field label="Дни недели">
-            <div className="flex gap-1.5 flex-wrap">
-              {WEEKDAYS.map((d) => (
-                <button
-                  key={d.value}
-                  onClick={() => {
-                    setRecurringDays(
-                      recurringDays.includes(d.value)
-                        ? recurringDays.filter((x) => x !== d.value)
-                        : [...recurringDays, d.value]
-                    );
-                  }}
-                  className={`w-11 h-11 rounded-full border-2 text-sm font-bold transition ${
-                    recurringDays.includes(d.value)
-                      ? 'border-stone-900 bg-stone-900 text-stone-50'
-                      : 'border-stone-300 bg-white text-stone-700 hover:border-stone-500'
-                  }`}
-                  style={{ fontFamily: "'JetBrains Mono', monospace" }}
-                >
-                  {d.short}
-                </button>
-              ))}
-            </div>
-          </Field>
-          <Field label="На сколько недель вперёд">
-            <div className="grid grid-cols-4 gap-2">
-              {[2, 4, 8, 12].map((w) => (
-                <button
-                  key={w}
-                  onClick={() => setRecurringWeeks(w)}
-                  className={`py-2 rounded border-2 font-bold transition ${
-                    recurringWeeks === w
-                      ? 'border-stone-900 bg-stone-900 text-stone-50'
-                      : 'border-stone-300 bg-white text-stone-700 hover:border-stone-500'
-                  }`}
-                >
-                  {w} нед.
-                </button>
-              ))}
-            </div>
-          </Field>
-          <button
-            onClick={handleAddRecurring}
-            disabled={!name.trim() || recurringDays.length === 0}
-            className="w-full bg-orange-600 hover:bg-orange-700 disabled:bg-stone-300 disabled:cursor-not-allowed text-white py-3 rounded font-bold tracking-wide transition active:scale-95 mt-2"
-            style={{ fontFamily: "'Fraunces', serif" }}
-          >
-            Создать слоты
           </button>
         </Modal>
       )}
@@ -794,37 +586,91 @@ function TabButton({ active, onClick, children }) {
   );
 }
 
-function PartnersTab({ sessions, checkins, currentName, filter, setFilter, onDelete, onToggleInterest, onComplete }) {
-  const climberName = currentName.trim() || 'Аноним';
+function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, onStartNewSession, onComplete, onCancel, onGoToLeaderboard }) {
+  const climberName = currentName.trim();
+
+  // Ищем активную (запланированную) запись текущего пользователя — самую раннюю в будущем или прошлом сегодня
+  const now = Date.now();
+  const myPendingSession = sessions
+    .filter((s) => s.name === climberName)
+    .filter((s) => {
+      const dt = new Date(s.date + 'T' + s.time);
+      return dt.getTime() > now - 24 * 60 * 60 * 1000;
+    })
+    .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time))[0];
+
+  const myLevel = climberName ? climberLevels[climberName]?.level : null;
+  const top3 = leaderboard.slice(0, 3);
 
   return (
-    <>
-      {checkins.length > 0 && (
-        <section className="mb-6">
-          <div className="flex items-center gap-2 mb-2">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+    <div className="space-y-8">
+      {/* Главное действие: либо большая кнопка, либо карточка ожидания */}
+      {myPendingSession ? (
+        <PendingSessionCard
+          session={myPendingSession}
+          onComplete={() => onComplete(myPendingSession)}
+          onCancel={() => onCancel(myPendingSession.id)}
+        />
+      ) : (
+        <div className="text-center py-8">
+          <p className="text-stone-500 text-sm mb-6" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+            {climberName ? `Привет, ${climberName}` : 'Добро пожаловать'}
+          </p>
+          <button
+            onClick={onStartNewSession}
+            className="bg-orange-600 hover:bg-orange-700 active:scale-95 text-white text-2xl font-black tracking-wide w-full max-w-sm mx-auto block py-8 rounded-2xl shadow-lg transition"
+            style={{ fontFamily: "'Fraunces', serif" }}
+          >
+            🧗 Иду лазать
+          </button>
+          {myLevel && (
+            <p className="text-xs text-stone-500 mt-4" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+              твой уровень: <span className="font-bold text-orange-700">{myLevel.label}</span>
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Мини-рейтинг */}
+      {top3.length > 0 && (
+        <section>
+          <div className="flex items-baseline justify-between mb-3">
             <h2 className="text-xs uppercase tracking-widest text-stone-700 font-bold" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-              Сейчас в зале
+              🏆 Топ недели
             </h2>
+            <button
+              onClick={onGoToLeaderboard}
+              className="text-xs text-orange-700 hover:text-orange-900 font-bold"
+              style={{ fontFamily: "'JetBrains Mono', monospace" }}
+            >
+              весь рейтинг ›
+            </button>
           </div>
           <div className="space-y-2">
-            {checkins.map((c) => {
-              const cond = CONDITIONS.find((x) => x.value === c.condition);
-              const isMine = c.name === climberName;
+            {top3.map((s, i) => {
+              const isMe = s.name === climberName;
+              const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : '🥉';
               return (
-                <div key={c.id} className={`bg-white border-2 rounded-lg p-3 ${isMine ? 'border-emerald-500' : 'border-stone-200'}`}>
-                  <div className="flex items-baseline gap-2 flex-wrap">
-                    <span className="font-bold text-stone-900">{c.name}</span>
-                    {isMine && <span className="text-[10px] uppercase tracking-widest text-emerald-700 font-bold" style={{ fontFamily: "'JetBrains Mono', monospace" }}>это ты</span>}
-                    {cond && <span title={cond.label}>{cond.emoji}</span>}
-                    <span className="text-stone-400">·</span>
-                    <span className="text-stone-700 text-sm">{c.gym}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-2 mt-1">
-                    <span className="text-xs text-stone-500" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                      {timeAgo(c.checkedInAt)}
-                    </span>
-                    {c.note && <span className="text-sm text-stone-700 italic flex-1 text-right">«{c.note}»</span>}
+                <div
+                  key={s.name}
+                  className={`bg-white border rounded-lg p-3 ${isMe ? 'border-orange-600 border-2' : 'border-stone-200'}`}
+                >
+                  <div className="flex items-center gap-3">
+                    <span className="text-2xl">{medal}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-baseline gap-2 flex-wrap">
+                        <span className="font-bold text-stone-900">{s.name}</span>
+                        {isMe && <span className="text-[10px] uppercase tracking-widest text-orange-700 font-bold" style={{ fontFamily: "'JetBrains Mono', monospace" }}>ты</span>}
+                      </div>
+                      <div className="text-xs text-stone-600" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                        {s.sessions} {s.sessions === 1 ? 'тренировка' : s.sessions < 5 ? 'тренировки' : 'тренировок'}
+                      </div>
+                    </div>
+                    {s.maxGrade && (
+                      <div className="text-lg font-black text-orange-600" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                        {s.maxGrade.grade}
+                      </div>
+                    )}
                   </div>
                 </div>
               );
@@ -832,20 +678,61 @@ function PartnersTab({ sessions, checkins, currentName, filter, setFilter, onDel
           </div>
         </section>
       )}
+    </div>
+  );
+}
 
-      <div className="flex items-baseline justify-between mb-3">
-        <h2 className="text-xs uppercase tracking-widest text-stone-700 font-bold" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-          Запланировано
-        </h2>
+function PendingSessionCard({ session, onComplete, onCancel }) {
+  const styleInfo = STYLES.find((st) => st.value === session.style);
+  return (
+    <div className="bg-gradient-to-br from-orange-50 to-amber-50 border-2 border-orange-600 rounded-2xl p-6">
+      <div className="text-[10px] uppercase tracking-widest text-orange-700 font-bold mb-3 text-center" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+        ✨ ты записался · ждём начала
       </div>
+      <h2 className="text-2xl font-black text-stone-900 text-center mb-1">
+        {session.gym}
+      </h2>
+      <p className="text-center text-stone-700 text-lg" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+        {formatDate(session.date)} в {session.time}
+        {styleInfo && styleInfo.value !== 'any' && <> · {styleInfo.label}</>}
+      </p>
+      {session.note && (
+        <p className="text-stone-600 text-sm mt-3 italic text-center">«{session.note}»</p>
+      )}
 
+      <div className="space-y-2 mt-6">
+        <button
+          onClick={onComplete}
+          className="w-full bg-orange-600 hover:bg-orange-700 text-white py-4 rounded-xl text-lg font-bold tracking-wide transition active:scale-95"
+          style={{ fontFamily: "'Fraunces', serif" }}
+        >
+          ✓ Отметить пройденным
+        </button>
+        <button
+          onClick={onCancel}
+          className="w-full bg-transparent hover:bg-stone-100 text-stone-500 hover:text-stone-700 py-2 rounded-xl text-sm transition"
+          style={{ fontFamily: "'Fraunces', serif" }}
+        >
+          Отменить запись
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PartnersTab({ sessions, climberLevels, currentName, filter, setFilter, onDelete, onToggleInterest, onComplete }) {
+  const climberName = currentName.trim() || 'Аноним';
+
+  return (
+    <>
       <div className="flex gap-2 mb-4 overflow-x-auto pb-1">
         <FilterChip active={filter === 'all'} onClick={() => setFilter('all')}>все уровни</FilterChip>
-        {LEVELS.map((l) => (
+        {LEVEL_GROUPS.map((l) => (
           <FilterChip key={l.value} active={filter === l.value} onClick={() => setFilter(l.value)}>
-            {l.label.toLowerCase()}
+            {l.label}
           </FilterChip>
         ))}
+        <FilterChip active={filter === 'unknown'} onClick={() => setFilter('unknown')}>нет данных</FilterChip>
       </div>
 
       {sessions.length === 0 ? (
@@ -857,7 +744,7 @@ function PartnersTab({ sessions, checkins, currentName, filter, setFilter, onDel
       ) : (
         <div className="space-y-3">
           {sessions.map((s) => {
-            const levelInfo = LEVELS.find((l) => l.value === s.level);
+            const levelInfo = climberLevels[s.name]?.level;
             const styleInfo = STYLES.find((st) => st.value === s.style);
             const condInfo = CONDITIONS.find((c) => c.value === s.condition);
             const interested = s.interested || [];
@@ -870,9 +757,15 @@ function PartnersTab({ sessions, checkins, currentName, filter, setFilter, onDel
                   <div className="flex-1 min-w-0">
                     <div className="flex items-baseline gap-2 flex-wrap mb-1">
                       <h3 className="text-lg font-bold text-stone-900">{s.name}</h3>
-                      <span className="text-[10px] uppercase tracking-widest px-2 py-0.5 bg-orange-100 text-orange-800 rounded" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                        {levelInfo?.label}
-                      </span>
+                      {levelInfo ? (
+                        <span className="text-[10px] uppercase tracking-widest px-2 py-0.5 bg-orange-100 text-orange-800 rounded" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                          {levelInfo.label}
+                        </span>
+                      ) : (
+                        <span className="text-[10px] uppercase tracking-widest px-2 py-0.5 bg-stone-100 text-stone-500 rounded" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                          нет данных
+                        </span>
+                      )}
                       {condInfo && <span title={condInfo.label}>{condInfo.emoji}</span>}
                       {s.recurring && <span className="text-[10px] text-stone-500" title="Регулярный слот">⟳</span>}
                     </div>
@@ -1053,6 +946,11 @@ function LeaderboardTab({ board, period, setPeriod, currentName, onSelectClimber
                     <div className="flex items-baseline gap-2 flex-wrap">
                       <span className="font-bold text-stone-900 text-lg">{s.name}</span>
                       {isMe && <span className="text-[10px] uppercase tracking-widest text-orange-700 font-bold" style={{ fontFamily: "'JetBrains Mono', monospace" }}>ты</span>}
+                      {s.maxGrade && (
+                        <span className="text-[10px] uppercase tracking-widest px-2 py-0.5 bg-orange-100 text-orange-800 rounded" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+                          {levelFromTopScore(s.maxGrade.score)?.label}
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-baseline gap-3 text-sm text-stone-600 mt-0.5" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
                       <span><b className="text-stone-900">{s.sessions}</b> {s.sessions === 1 ? 'тренировка' : s.sessions < 5 ? 'тренировки' : 'тренировок'}</span>
@@ -1246,7 +1144,7 @@ function Modal({ title, onClose, children }) {
 
 function SessionFormFields({
   name, setName, gym, setGym, date, setDate, time, setTime,
-  level, setLevel, style, setStyle, condition, setCondition, note, setNote,
+  style, setStyle, condition, setCondition, note, setNote,
   showDate,
 }) {
   return (
@@ -1292,27 +1190,6 @@ function SessionFormFields({
           />
         </Field>
       </div>
-
-      <Field label="Уровень">
-        <div className="grid grid-cols-3 gap-2">
-          {LEVELS.map((l) => (
-            <button
-              key={l.value}
-              onClick={() => setLevel(l.value)}
-              className={`px-2 py-2 rounded border-2 text-center transition ${
-                level === l.value
-                  ? 'border-stone-900 bg-stone-900 text-stone-50'
-                  : 'border-stone-300 bg-white text-stone-700 hover:border-stone-500'
-              }`}
-            >
-              <div className="text-sm font-bold">{l.label}</div>
-              <div className="text-[10px] opacity-70 mt-0.5" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
-                {l.range}
-              </div>
-            </button>
-          ))}
-        </div>
-      </Field>
 
       <Field label="Стиль">
         <div className="grid grid-cols-3 gap-2">
