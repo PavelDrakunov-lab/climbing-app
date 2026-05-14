@@ -38,9 +38,6 @@ const WEEKDAYS = [
   { value: 0, short: 'Вс', label: 'Воскресенье' },
 ];
 
-// Код группы. На этапе 3 заменим на ввод пользователем.
-const GROUP_CODE = 'MY-CREW';
-
 const GRADE_SCORES = {
   '5a': 1, '5b': 2, '5c': 3,
   '6a': 4, '6a+': 5, '6b': 6, '6b+': 7, '6c': 8, '6c+': 9,
@@ -135,6 +132,12 @@ function maxGradeFromText(text) {
 }
 
 export default function App() {
+  // Код группы — изоляция данных между разными компаниями.
+  // Читаем из localStorage, чтобы при следующем заходе не вводить заново.
+  const [groupCode, setGroupCode] = useState(() => {
+    try { return localStorage.getItem('group-code') || ''; } catch (e) { return ''; }
+  });
+
   const [tab, setTab] = useState('home'); // home | partners | log | leaderboard | gyms
   const [sessions, setSessions] = useState([]);
   const [log, setLog] = useState([]);
@@ -172,14 +175,17 @@ export default function App() {
     return () => clearInterval(i);
   }, []);
 
-  // Загрузка из Supabase + подписка на realtime-обновления
+  // Загрузка из Supabase + подписка на realtime-обновления.
+  // Перезапускается при смене groupCode (выход и заход в другую группу).
   useEffect(() => {
+    if (!groupCode) { setLoading(false); return; }
+    setLoading(true);
     async function load() {
       try {
         const [sessionsRes, logRes, gymsRes] = await Promise.all([
-          supabase.from('sessions').select('*').eq('group_code', GROUP_CODE),
-          supabase.from('log').select('*').eq('group_code', GROUP_CODE),
-          supabase.from('gym_notes').select('*').eq('group_code', GROUP_CODE),
+          supabase.from('sessions').select('*').eq('group_code', groupCode),
+          supabase.from('log').select('*').eq('group_code', groupCode),
+          supabase.from('gym_notes').select('*').eq('group_code', groupCode),
         ]);
         if (sessionsRes.data) setSessions(sessionsRes.data);
         if (logRes.data) setLog(logRes.data.map((e) => ({ ...e, gradeList: e.grade_list })));
@@ -201,16 +207,16 @@ export default function App() {
     // и перезагружаем нужную таблицу. Это даёт ощущение «общей доски».
     const channel = supabase
       .channel('climbing-realtime')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'sessions', filter: `group_code=eq.${GROUP_CODE}` }, async () => {
-        const { data } = await supabase.from('sessions').select('*').eq('group_code', GROUP_CODE);
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'sessions', filter: `group_code=eq.${groupCode}` }, async () => {
+        const { data } = await supabase.from('sessions').select('*').eq('group_code', groupCode);
         if (data) setSessions(data);
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'log', filter: `group_code=eq.${GROUP_CODE}` }, async () => {
-        const { data } = await supabase.from('log').select('*').eq('group_code', GROUP_CODE);
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'log', filter: `group_code=eq.${groupCode}` }, async () => {
+        const { data } = await supabase.from('log').select('*').eq('group_code', groupCode);
         if (data) setLog(data.map((e) => ({ ...e, gradeList: e.grade_list })));
       })
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'gym_notes', filter: `group_code=eq.${GROUP_CODE}` }, async () => {
-        const { data } = await supabase.from('gym_notes').select('*').eq('group_code', GROUP_CODE);
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gym_notes', filter: `group_code=eq.${groupCode}` }, async () => {
+        const { data } = await supabase.from('gym_notes').select('*').eq('group_code', groupCode);
         if (data) {
           const map = {};
           for (const row of data) map[row.gym] = row.note;
@@ -220,7 +226,7 @@ export default function App() {
       .subscribe();
 
     return () => { supabase.removeChannel(channel); };
-  }, []);
+  }, [groupCode]);
 
   // Все записи в базу делаются прямыми вызовами supabase в каждом handler.
   // Локальный state обновляется автоматически через realtime-подписку выше.
@@ -239,7 +245,7 @@ export default function App() {
     };
     // Записываем в Supabase. realtime-подписка сама обновит локальный state у всех клиентов.
     const { error } = await supabase.from('sessions').insert({
-      group_code: GROUP_CODE,
+      group_code: groupCode,
       name: newSession.name,
       gym: newSession.gym,
       date: newSession.date,
@@ -316,7 +322,7 @@ export default function App() {
     };
     // Сохраняем в журнал и удаляем запланированную запись
     const { error: logErr } = await supabase.from('log').insert({
-      group_code: GROUP_CODE,
+      group_code: groupCode,
       name: entry.name,
       gym: entry.gym,
       date: entry.date,
@@ -350,15 +356,15 @@ export default function App() {
     if (text) {
       // upsert: вставить или обновить, если уже есть для этой пары (group_code, gym)
       // сначала удалим старую запись (если есть), потом вставим новую
-      await supabase.from('gym_notes').delete().match({ group_code: GROUP_CODE, gym: editingGym });
+      await supabase.from('gym_notes').delete().match({ group_code: groupCode, gym: editingGym });
       const { error } = await supabase.from('gym_notes').insert({
-        group_code: GROUP_CODE,
+        group_code: groupCode,
         gym: editingGym,
         note: text,
       });
       if (error) console.error('save gym note error:', error);
     } else {
-      await supabase.from('gym_notes').delete().match({ group_code: GROUP_CODE, gym: editingGym });
+      await supabase.from('gym_notes').delete().match({ group_code: groupCode, gym: editingGym });
     }
     setEditingGym(null);
   }
@@ -415,6 +421,27 @@ export default function App() {
       .sort((a, b) => b.sessions - a.sessions || (b.maxGrade?.score || 0) - (a.maxGrade?.score || 0));
   }, [log, boardPeriod]);
 
+  function handleJoinGroup(code) {
+    const normalized = code.trim().toUpperCase();
+    if (!normalized) return;
+    try { localStorage.setItem('group-code', normalized); } catch (e) {}
+    setGroupCode(normalized);
+  }
+
+  function handleLeaveGroup() {
+    try { localStorage.removeItem('group-code'); } catch (e) {}
+    setGroupCode('');
+    // Очищаем локальный state, чтобы при входе в новую группу не было старых данных
+    setSessions([]);
+    setLog([]);
+    setGymNotes({});
+  }
+
+  // Если пользователь не в группе — показываем экран ввода кода
+  if (!groupCode) {
+    return <GroupCodeScreen onSubmit={handleJoinGroup} />;
+  }
+
   return (
     <div className="min-h-screen bg-stone-50" style={{ fontFamily: "'Fraunces', Georgia, serif" }}>
       <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700;9..144,900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
@@ -444,6 +471,7 @@ export default function App() {
             climberLevels={climberLevels}
             leaderboard={leaderboard}
             currentName={name}
+            groupCode={groupCode}
             onStartNewSession={() => {
               setDate(todayISO());
               setTime(nowPlusHourTime());
@@ -452,6 +480,7 @@ export default function App() {
             onComplete={openComplete}
             onCancel={handleDeleteSession}
             onGoToLeaderboard={() => setTab('leaderboard')}
+            onLeaveGroup={handleLeaveGroup}
           />
         ) : tab === 'partners' ? (
           <PartnersTab
@@ -637,7 +666,7 @@ function TabButton({ active, onClick, children }) {
   );
 }
 
-function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, onStartNewSession, onComplete, onCancel, onGoToLeaderboard }) {
+function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, groupCode, onStartNewSession, onComplete, onCancel, onGoToLeaderboard, onLeaveGroup }) {
   const climberName = currentName.trim();
 
   // Ищем активную (запланированную) запись текущего пользователя — самую раннюю в будущем или прошлом сегодня
@@ -729,6 +758,25 @@ function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, onSta
           </div>
         </section>
       )}
+
+
+      {/* Подвал с информацией о группе */}
+      <div className="text-center pt-8 border-t border-stone-200">
+        <p className="text-xs text-stone-400" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+          группа: <span className="font-bold text-stone-600">{groupCode}</span>
+          {' · '}
+          <button
+            onClick={() => {
+              if (confirm('Выйти из группы? Локальные данные удалятся, но в облаке всё останется. Можно будет вернуться по коду.')) {
+                onLeaveGroup();
+              }
+            }}
+            className="underline hover:text-stone-700"
+          >
+            сменить
+          </button>
+        </p>
+      </div>
     </div>
   );
 }
@@ -1426,5 +1474,59 @@ function Field({ label, children }) {
       </div>
       {children}
     </label>
+  );
+}
+
+function GroupCodeScreen({ onSubmit }) {
+  const [value, setValue] = useState('');
+
+  function handleSubmit() {
+    if (value.trim()) onSubmit(value);
+  }
+
+  return (
+    <div className="min-h-screen bg-stone-50 flex items-center justify-center px-4" style={{ fontFamily: "'Fraunces', Georgia, serif" }}>
+      <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700;9..144,900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+      <div className="max-w-sm w-full text-center">
+        <h1 className="text-3xl font-black tracking-tight text-stone-900 leading-none mb-2">
+          КТО ЛЕЗЕТ
+        </h1>
+        <p className="text-xs text-stone-500 mb-8" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+          партнёры по тренировкам
+        </p>
+
+        <div className="bg-white border-2 border-stone-900 rounded-2xl p-6">
+          <h2 className="text-xl font-black text-stone-900 mb-2">Введи код группы</h2>
+          <p className="text-sm text-stone-600 mb-5">
+            Все, кто введёт этот же код, окажутся в одной общей группе и будут видеть тренировки друг друга.
+          </p>
+
+          <input
+            type="text"
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') handleSubmit(); }}
+            placeholder="например: PITER-CREW"
+            className="w-full bg-stone-50 border-2 border-stone-300 rounded-lg px-4 py-3 text-center text-lg font-bold tracking-wider text-stone-900 focus:border-orange-600 focus:outline-none uppercase mb-4"
+            style={{ fontFamily: "'JetBrains Mono', monospace" }}
+            autoFocus
+          />
+
+          <button
+            onClick={handleSubmit}
+            disabled={!value.trim()}
+            className="w-full bg-orange-600 hover:bg-orange-700 disabled:bg-stone-300 disabled:cursor-not-allowed text-white py-3 rounded-lg font-bold tracking-wide transition active:scale-95"
+            style={{ fontFamily: "'Fraunces', serif" }}
+          >
+            Войти в группу
+          </button>
+        </div>
+
+        <p className="text-xs text-stone-400 mt-6 leading-relaxed" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
+          придумай любой код и поделись им с друзьями.<br />
+          у каждой группы своё пространство.
+        </p>
+      </div>
+    </div>
   );
 }
