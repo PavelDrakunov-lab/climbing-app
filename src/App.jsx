@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
+import { supabase } from './supabase';
 
 const GYMS = [
   'Северная Стена · Петроградская',
@@ -37,9 +38,8 @@ const WEEKDAYS = [
   { value: 0, short: 'Вс', label: 'Воскресенье' },
 ];
 
-const SESSIONS_KEY = 'climbing-sessions-v2';
-const LOG_KEY = 'climbing-log-v1';
-const GYM_NOTES_KEY = 'climbing-gym-notes-v1';
+// Код группы. На этапе 3 заменим на ввод пользователем.
+const GROUP_CODE = 'MY-CREW';
 
 const GRADE_SCORES = {
   '5a': 1, '5b': 2, '5c': 3,
@@ -172,44 +172,58 @@ export default function App() {
     return () => clearInterval(i);
   }, []);
 
+  // Загрузка из Supabase + подписка на realtime-обновления
   useEffect(() => {
-    function load() {
+    async function load() {
       try {
-        const sessionsRaw = localStorage.getItem(SESSIONS_KEY);
-        if (sessionsRaw) {
-          const parsed = JSON.parse(sessionsRaw);
-          if (Array.isArray(parsed)) setSessions(parsed);
-        }
-        const logRaw = localStorage.getItem(LOG_KEY);
-        if (logRaw) {
-          const parsed = JSON.parse(logRaw);
-          if (Array.isArray(parsed)) setLog(parsed);
-        }
-        const gymsRaw = localStorage.getItem(GYM_NOTES_KEY);
-        if (gymsRaw) {
-          const parsed = JSON.parse(gymsRaw);
-          if (parsed && typeof parsed === 'object') setGymNotes(parsed);
+        const [sessionsRes, logRes, gymsRes] = await Promise.all([
+          supabase.from('sessions').select('*').eq('group_code', GROUP_CODE),
+          supabase.from('log').select('*').eq('group_code', GROUP_CODE),
+          supabase.from('gym_notes').select('*').eq('group_code', GROUP_CODE),
+        ]);
+        if (sessionsRes.data) setSessions(sessionsRes.data);
+        if (logRes.data) setLog(logRes.data.map((e) => ({ ...e, gradeList: e.grade_list })));
+        if (gymsRes.data) {
+          // превращаем массив в объект {gymName: noteText}
+          const map = {};
+          for (const row of gymsRes.data) map[row.gym] = row.note;
+          setGymNotes(map);
         }
         const savedName = localStorage.getItem('climber-name');
         if (savedName) setName(savedName);
-      } catch (e) { console.error(e); }
+      } catch (e) { console.error('Supabase load error:', e); }
       setLoading(false);
     }
     load();
+
+    // Подписка на обновления в реальном времени.
+    // Когда друг добавляет/удаляет/обновляет запись — мы сразу получаем уведомление
+    // и перезагружаем нужную таблицу. Это даёт ощущение «общей доски».
+    const channel = supabase
+      .channel('climbing-realtime')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'sessions', filter: `group_code=eq.${GROUP_CODE}` }, async () => {
+        const { data } = await supabase.from('sessions').select('*').eq('group_code', GROUP_CODE);
+        if (data) setSessions(data);
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'log', filter: `group_code=eq.${GROUP_CODE}` }, async () => {
+        const { data } = await supabase.from('log').select('*').eq('group_code', GROUP_CODE);
+        if (data) setLog(data.map((e) => ({ ...e, gradeList: e.grade_list })));
+      })
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'gym_notes', filter: `group_code=eq.${GROUP_CODE}` }, async () => {
+        const { data } = await supabase.from('gym_notes').select('*').eq('group_code', GROUP_CODE);
+        if (data) {
+          const map = {};
+          for (const row of data) map[row.gym] = row.note;
+          setGymNotes(map);
+        }
+      })
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
   }, []);
 
-  function saveSessions(next) {
-    setSessions(next);
-    try { localStorage.setItem(SESSIONS_KEY, JSON.stringify(next)); } catch (e) { console.error(e); }
-  }
-  function saveLog(next) {
-    setLog(next);
-    try { localStorage.setItem(LOG_KEY, JSON.stringify(next)); } catch (e) { console.error(e); }
-  }
-  function saveGymNotes(next) {
-    setGymNotes(next);
-    try { localStorage.setItem(GYM_NOTES_KEY, JSON.stringify(next)); } catch (e) { console.error(e); }
-  }
+  // Все записи в базу делаются прямыми вызовами supabase в каждом handler.
+  // Локальный state обновляется автоматически через realtime-подписку выше.
 
   async function handleAddSession() {
     if (!name.trim()) return;
@@ -223,27 +237,39 @@ export default function App() {
       interested: [],
       createdAt: Date.now(),
     };
-    saveSessions([...sessions, newSession]);
+    // Записываем в Supabase. realtime-подписка сама обновит локальный state у всех клиентов.
+    const { error } = await supabase.from('sessions').insert({
+      group_code: GROUP_CODE,
+      name: newSession.name,
+      gym: newSession.gym,
+      date: newSession.date,
+      time: newSession.time,
+      style: newSession.style,
+      condition: newSession.condition,
+      note: newSession.note,
+      interested: newSession.interested,
+    });
+    if (error) console.error('insert session error:', error);
     setShowSessionForm(false);
     setNote('');
     setTab('home');
   }
 
   async function handleDeleteSession(id) {
-    saveSessions(sessions.filter((s) => s.id !== id));
+    const { error } = await supabase.from('sessions').delete().eq('id', id);
+    if (error) console.error('delete session error:', error);
   }
 
   async function handleToggleInterest(sessionId) {
     const climber = name.trim() || 'Аноним';
-    const next = sessions.map((s) => {
-      if (s.id !== sessionId) return s;
-      const interested = s.interested || [];
-      if (interested.includes(climber)) {
-        return { ...s, interested: interested.filter((x) => x !== climber) };
-      }
-      return { ...s, interested: [...interested, climber] };
-    });
-    saveSessions(next);
+    const target = sessions.find((s) => s.id === sessionId);
+    if (!target) return;
+    const current = target.interested || [];
+    const nextList = current.includes(climber)
+      ? current.filter((x) => x !== climber)
+      : [...current, climber];
+    const { error } = await supabase.from('sessions').update({ interested: nextList }).eq('id', sessionId);
+    if (error) console.error('toggle interest error:', error);
   }
 
   function openComplete(session) {
@@ -288,14 +314,29 @@ export default function App() {
       note: completedNote.trim(),
       completedAt: Date.now(),
     };
-    saveLog([entry, ...log]);
-    saveSessions(sessions.filter((s) => s.id !== completingSession.id));
+    // Сохраняем в журнал и удаляем запланированную запись
+    const { error: logErr } = await supabase.from('log').insert({
+      group_code: GROUP_CODE,
+      name: entry.name,
+      gym: entry.gym,
+      date: entry.date,
+      flash: entry.flash,
+      projects: entry.projects,
+      attempts: entry.attempts,
+      grade_list: entry.gradeList,
+      felt: entry.felt,
+      note: entry.note,
+    });
+    if (logErr) console.error('insert log error:', logErr);
+    const { error: delErr } = await supabase.from('sessions').delete().eq('id', completingSession.id);
+    if (delErr) console.error('delete session error:', delErr);
     setCompletingSession(null);
     setTab('leaderboard');
   }
 
   async function handleDeleteLogEntry(id) {
-    saveLog(log.filter((e) => e.id !== id));
+    const { error } = await supabase.from('log').delete().eq('id', id);
+    if (error) console.error('delete log entry error:', error);
   }
 
   function openGymNotes(g) {
@@ -305,10 +346,20 @@ export default function App() {
 
   async function handleSaveGymNote() {
     if (!editingGym) return;
-    const next = { ...gymNotes };
-    if (gymNoteText.trim()) next[editingGym] = gymNoteText.trim();
-    else delete next[editingGym];
-    saveGymNotes(next);
+    const text = gymNoteText.trim();
+    if (text) {
+      // upsert: вставить или обновить, если уже есть для этой пары (group_code, gym)
+      // сначала удалим старую запись (если есть), потом вставим новую
+      await supabase.from('gym_notes').delete().match({ group_code: GROUP_CODE, gym: editingGym });
+      const { error } = await supabase.from('gym_notes').insert({
+        group_code: GROUP_CODE,
+        gym: editingGym,
+        note: text,
+      });
+      if (error) console.error('save gym note error:', error);
+    } else {
+      await supabase.from('gym_notes').delete().match({ group_code: GROUP_CODE, gym: editingGym });
+    }
     setEditingGym(null);
   }
 
