@@ -145,6 +145,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   const [showSessionForm, setShowSessionForm] = useState(false);
+  const [editingSession, setEditingSession] = useState(null); // если задано — форма работает в режиме редактирования
   const [completingSession, setCompletingSession] = useState(null);
   const [editingGym, setEditingGym] = useState(null);
 
@@ -235,30 +236,45 @@ export default function App() {
     if (!name.trim()) return;
     try { localStorage.setItem('climber-name', name.trim()); } catch (e) {}
 
-    const newSession = {
-      id: Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
-      name: name.trim(),
-      gym, date, time, style, condition,
-      note: note.trim(),
-      interested: [],
-      createdAt: Date.now(),
-    };
-    // Записываем в Supabase. realtime-подписка сама обновит локальный state у всех клиентов.
-    const { error } = await supabase.from('sessions').insert({
+    const payload = {
       group_code: groupCode,
-      name: newSession.name,
-      gym: newSession.gym,
-      date: newSession.date,
-      time: newSession.time,
-      style: newSession.style,
-      condition: newSession.condition,
-      note: newSession.note,
-      interested: newSession.interested,
-    });
-    if (error) console.error('insert session error:', error);
+      name: name.trim(),
+      gym,
+      date,
+      time,
+      style,
+      condition,
+      note: note.trim(),
+    };
+
+    if (editingSession) {
+      // Режим редактирования — обновляем существующую запись по id.
+      // interested не трогаем, чтобы не сбросить тех, кто уже отметился.
+      const { error } = await supabase.from('sessions').update(payload).eq('id', editingSession.id);
+      if (error) console.error('update session error:', error);
+    } else {
+      // Режим создания — новая запись с пустым списком заинтересованных.
+      const { error } = await supabase.from('sessions').insert({ ...payload, interested: [] });
+      if (error) console.error('insert session error:', error);
+    }
+
     setShowSessionForm(false);
+    setEditingSession(null);
     setNote('');
     setTab('home');
+  }
+
+  function openEditSession(session) {
+    // Заполняем поля формы текущими значениями записи и открываем модалку
+    setName(session.name);
+    setGym(session.gym);
+    setDate(session.date);
+    setTime(session.time);
+    setStyle(session.style || 'any');
+    setCondition(session.condition || 'normal');
+    setNote(session.note || '');
+    setEditingSession(session);
+    setShowSessionForm(true);
   }
 
   async function handleDeleteSession(id) {
@@ -479,6 +495,7 @@ export default function App() {
             }}
             onComplete={openComplete}
             onCancel={handleDeleteSession}
+            onEdit={openEditSession}
             onGoToLeaderboard={() => setTab('leaderboard')}
             onLeaveGroup={handleLeaveGroup}
           />
@@ -524,7 +541,10 @@ export default function App() {
       )}
 
       {showSessionForm && (
-        <Modal title="Новая запись" onClose={() => setShowSessionForm(false)}>
+        <Modal
+          title={editingSession ? 'Изменить запись' : 'Новая запись'}
+          onClose={() => { setShowSessionForm(false); setEditingSession(null); }}
+        >
           <SessionFormFields
             {...{ name, setName, gym, setGym, date, setDate, time, setTime,
                   style, setStyle, condition, setCondition, note, setNote }}
@@ -536,7 +556,7 @@ export default function App() {
             className="w-full bg-orange-600 hover:bg-orange-700 disabled:bg-stone-300 disabled:cursor-not-allowed text-white py-3 rounded font-bold tracking-wide transition active:scale-95 mt-2"
             style={{ fontFamily: "'Fraunces', serif" }}
           >
-            Записаться
+            {editingSession ? 'Сохранить изменения' : 'Записаться'}
           </button>
         </Modal>
       )}
@@ -666,7 +686,7 @@ function TabButton({ active, onClick, children }) {
   );
 }
 
-function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, groupCode, onStartNewSession, onComplete, onCancel, onGoToLeaderboard, onLeaveGroup }) {
+function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, groupCode, onStartNewSession, onComplete, onCancel, onEdit, onGoToLeaderboard, onLeaveGroup }) {
   const climberName = currentName.trim();
 
   // Ищем активную (запланированную) запись текущего пользователя — самую раннюю в будущем или прошлом сегодня
@@ -690,6 +710,7 @@ function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, group
           session={myPendingSession}
           onComplete={() => onComplete(myPendingSession)}
           onCancel={() => onCancel(myPendingSession.id)}
+          onEdit={() => onEdit(myPendingSession)}
         />
       ) : (
         <div className="text-center py-8">
@@ -781,10 +802,23 @@ function HomeTab({ sessions, log, climberLevels, leaderboard, currentName, group
   );
 }
 
-function PendingSessionCard({ session, onComplete, onCancel }) {
+function PendingSessionCard({ session, onComplete, onCancel, onEdit }) {
   const styleInfo = STYLES.find((st) => st.value === session.style);
   return (
-    <div className="bg-gradient-to-br from-orange-50 to-amber-50 border-2 border-orange-600 rounded-2xl p-6">
+    <div className="relative bg-gradient-to-br from-orange-50 to-amber-50 border-2 border-orange-600 rounded-2xl p-6">
+      {/* Карандашик редактирования в правом верхнем углу */}
+      <button
+        onClick={onEdit}
+        className="absolute top-3 right-3 w-9 h-9 flex items-center justify-center rounded-full text-stone-500 hover:text-orange-700 hover:bg-orange-100 transition"
+        title="Изменить запись"
+        aria-label="Изменить запись"
+      >
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M12 20h9" />
+          <path d="M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+        </svg>
+      </button>
+
       <div className="text-[10px] uppercase tracking-widest text-orange-700 font-bold mb-3 text-center" style={{ fontFamily: "'JetBrains Mono', monospace" }}>
         ✨ ты записался · ждём начала
       </div>
